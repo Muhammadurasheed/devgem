@@ -146,12 +146,6 @@ Location: `backend/agents/orchestrator.py` `_send_with_fallback()` method
 ## Phase 3: The "Wow" Factor (UX Polish)
 *Goal: Make the judges drop their jaws.*
 
-- [x] **Google-Tier Auth Experience** ✅ DONE
-    - Premium split-screen login page with animations
-    - Proper GitHub OAuth 2.0 flow (no manual PAT required)
-    - Framer Motion animations throughout
-    - Location: `src/pages/Auth.tsx`, `src/contexts/GitHubContext.tsx`
-
 - [ ] **Typing Animations & Real-Time Logs**
     - Implement the "Matrix" effect: Stream build logs into the chat UI as they happen
     - Use `framer-motion` for smooth layout transitions in React
