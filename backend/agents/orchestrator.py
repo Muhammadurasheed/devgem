@@ -6,11 +6,12 @@ FAANG-Level Production Implementation
 - Security best practices
 - Cost optimization
 - Advanced error handling
+- Multi-region fallback with distributed rate limiting
 """
 
 import asyncio
 import time
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Tuple
 import vertexai
 from vertexai.generative_models import GenerativeModel, Tool, FunctionDeclaration, Part, GenerationConfig
 from datetime import datetime
@@ -21,6 +22,7 @@ from dataclasses import dataclass
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from utils.progress_notifier import ProgressNotifier, DeploymentStages
+from utils.rate_limiter import get_rate_limiter, Priority, acquire_with_fallback
 
 
 @dataclass
@@ -67,20 +69,8 @@ class OrchestratorAgent:
             import google.generativeai as genai
             genai.configure(api_key=gemini_api_key)
         
-        # ULTRA-OPTIMIZED system instruction (47% token reduction)
-        system_instruction = """ServerGem: Deploy to Cloud Run.
-
-RULES:
-- NO user GCP auth needed
-- Provide .servergem.app URLs
-
-STATE:
-IF "Project Path:" exists → ONLY call deploy_to_cloudrun
-IF user says "deploy"/"yes"/"go" → IMMEDIATELY deploy
-ELSE → call clone_and_analyze_repo
-
-Env vars auto-parsed from .env. Never clone twice.
-        """.strip()
+        # Get system instruction from method (reusable)
+        system_instruction = self._get_system_instruction()
         
         # Initialize AI model (Vertex AI or Gemini API)
         # ✅ GEMINI 3 HACKATHON FIX: Use gemini-2.5-flash (Gemini 3 family)
@@ -274,81 +264,141 @@ Env vars auto-parsed from .env. Never clone twice.
 
     async def _send_with_fallback(self, message: str):
         """
-        Send message with automatic fallback: Vertex AI → Gemini API on quota exhaustion
+        FAANG-Level Message Sending with Multi-Region Fallback
+        
+        Fallback order:
+        1. Primary region (us-central1) via Vertex AI
+        2. Fallback regions (us-east1, europe-west1, asia-northeast1) via Vertex AI
+        3. Direct Gemini API with user's API key (last resort)
+        
+        This is how production systems at Google/OpenAI handle quota exhaustion.
         """
-        try:
-            # Try primary method (Vertex AI or Gemini API based on initialization)
-            return await self._retry_with_backoff(
-                lambda: self.chat_session.send_message(message),
-                max_retries=2,
-                base_delay=1.0
-            )
-        except Exception as e:
-            error_str = str(e).lower()
-            
-            # ✅ Check for quota/rate limit errors using both string and exception type
-            from google.api_core.exceptions import ResourceExhausted
-            is_quota_error = isinstance(e, ResourceExhausted) or any(keyword in error_str for keyword in [
-                'resource exhausted', '429', 'quota', 'rate limit'
-            ])
-            
-            if is_quota_error:
-                print(f"[Orchestrator] ⚠️ Quota error detected: {error_str}")
-                print(f"[Orchestrator] Fallback conditions:")
-                print(f"  - Using Vertex AI: {self.use_vertex_ai}")
-                print(f"  - Gemini API key available: {bool(self.gemini_api_key)}")
-                
-                # Check if fallback is possible
-                if self.use_vertex_ai and self.gemini_api_key:
-                    # Switch to Gemini API fallback
-                    print(f"[Orchestrator] ✅ Activating fallback to Gemini API")
-                    await self._send_progress_message("⚠️ Vertex AI quota exhausted. Switching to backup AI service...")
-                    await asyncio.sleep(0)  # ✅ Flush message immediately
+        rate_limiter = get_rate_limiter()
+        
+        # Estimate tokens for rate limiting
+        estimated_tokens = rate_limiter.estimate_tokens(message)
+        
+        # Acquire rate limit permission with fallback
+        can_proceed, best_region = await acquire_with_fallback(
+            message=message,
+            priority=Priority.HIGH,  # Chat operations are high priority
+            preferred_region=self.gcloud_project and 'us-central1'
+        )
+        
+        if not can_proceed:
+            await self._send_progress_message("⚠️ High API load detected, request queued...")
+        
+        # Define the regions to try
+        regions_to_try = [best_region] if best_region else []
+        regions_to_try.extend(['us-central1', 'us-east1', 'europe-west1', 'asia-northeast1'])
+        regions_to_try = list(dict.fromkeys(regions_to_try))  # Remove duplicates, preserve order
+        
+        last_error = None
+        
+        for region in regions_to_try:
+            try:
+                # Re-initialize Vertex AI for this region if different from current
+                if self.use_vertex_ai:
+                    vertexai.init(project=self.gcloud_project, location=region)
                     
-                    try:
-                        import google.generativeai as genai
-                        # ✅ CRITICAL: Re-configure with API key to ensure clean state
-                        genai.configure(api_key=self.gemini_api_key)
-                        
-                        # ✅ GEMINI 3 FALLBACK: Use gemini-2.5-flash (Gemini 3)
-                        # The backup also uses Gemini 3 for hackathon compliance
-                        backup_model = genai.GenerativeModel(
-                            model_name='gemini-2.5-flash-preview-05-20',  # ✅ Gemini 3 Flash
-                            tools=[self._get_function_declarations_genai()]
-                        )
-                        print("[Orchestrator] ✅ Fallback using Gemini 3 (gemini-2.5-flash)")
-                        
-                        # Create FRESH chat session (no history to avoid model name conflicts)
-                        backup_chat = backup_model.start_chat(history=[])
-                        
-                        # Send message with fresh session
-                        response = backup_chat.send_message(message)
-                        
-                        # Switch permanently to Gemini API
-                        self.use_vertex_ai = False
-                        self.model = backup_model
-                        self.chat_session = backup_chat
-                        
-                        print(f"[Orchestrator] ✅ Successfully switched to Gemini API")
-                        await self._send_progress_message("✅ Now using Gemini API - deployment continues...")
-                        await asyncio.sleep(0)  # ✅ Flush message immediately
-                        return response
-                        
-                    except Exception as fallback_err:
-                        print(f"[Orchestrator] ❌ Fallback to Gemini API failed: {fallback_err}")
-                        raise Exception(f"Both Vertex AI and Gemini API failed. Gemini API error: {str(fallback_err)}")
+                    # Recreate model for this region
+                    self.model = GenerativeModel(
+                        'gemini-2.5-flash-preview-05-20',
+                        tools=[self._get_function_declarations()],
+                        system_instruction=self._get_system_instruction()
+                    )
+                    self.chat_session = self.model.start_chat(history=[])
+                    
+                    print(f"[Orchestrator] 🌍 Trying region: {region}")
                 
-                elif not self.gemini_api_key:
-                    # No API key available for fallback
-                    print(f"[Orchestrator] ❌ No Gemini API key available for fallback")
-                    raise Exception(f"Vertex AI quota exhausted. Please add a Gemini API key in Settings to continue.")
+                # Try sending message with retry logic
+                response = await self._retry_with_backoff(
+                    lambda: self.chat_session.send_message(message),
+                    max_retries=2,
+                    base_delay=1.0
+                )
+                
+                # Success! Record and return
+                rate_limiter.record_success(region)
+                print(f"[Orchestrator] ✅ Request succeeded in region: {region}")
+                return response
+                
+            except Exception as e:
+                error_str = str(e).lower()
+                last_error = e
+                
+                # Check for quota/rate limit errors
+                from google.api_core.exceptions import ResourceExhausted
+                is_quota_error = isinstance(e, ResourceExhausted) or any(
+                    keyword in error_str for keyword in [
+                        'resource exhausted', '429', 'quota', 'rate limit', 'too many requests'
+                    ]
+                )
+                
+                if is_quota_error:
+                    rate_limiter.record_failure(region, str(e))
+                    print(f"[Orchestrator] ⚠️ Region {region} quota exhausted, trying next...")
+                    await self._send_progress_message(f"⚠️ Region {region} busy, switching to backup...")
+                    await asyncio.sleep(0)  # Flush message
+                    continue  # Try next region
                 else:
-                    # Already using Gemini API and still got quota error
-                    print(f"[Orchestrator] ❌ Gemini API also quota exhausted")
-                    raise Exception(f"Gemini API quota exhausted. Please wait a few minutes and try again.")
+                    # Non-quota error - don't continue to other regions
+                    raise
+        
+        # All Vertex AI regions exhausted - try Gemini API fallback
+        if self.gemini_api_key:
+            print(f"[Orchestrator] 🔄 All Vertex AI regions exhausted, switching to Gemini API")
+            await self._send_progress_message("⚠️ All regions busy. Activating backup AI service...")
+            await asyncio.sleep(0)
             
-            # Re-raise if not quota error
-            raise
+            try:
+                import google.generativeai as genai
+                genai.configure(api_key=self.gemini_api_key)
+                
+                backup_model = genai.GenerativeModel(
+                    model_name='gemini-2.5-flash-preview-05-20',
+                    tools=[self._get_function_declarations_genai()]
+                )
+                
+                backup_chat = backup_model.start_chat(history=[])
+                response = backup_chat.send_message(message)
+                
+                # Switch permanently to Gemini API for this session
+                self.use_vertex_ai = False
+                self.model = backup_model
+                self.chat_session = backup_chat
+                
+                print(f"[Orchestrator] ✅ Successfully switched to Gemini API")
+                await self._send_progress_message("✅ Backup AI service activated - continuing...")
+                await asyncio.sleep(0)
+                return response
+                
+            except Exception as fallback_err:
+                print(f"[Orchestrator] ❌ Gemini API fallback failed: {fallback_err}")
+                raise Exception(f"All AI services exhausted. Primary: {last_error}. Backup: {fallback_err}")
+        
+        # No API key for fallback
+        raise Exception(
+            f"Vertex AI quota exhausted in all regions. "
+            f"Please add a Gemini API key in Settings for automatic fallback, "
+            f"or wait a few minutes and try again."
+        )
+    
+    def _get_system_instruction(self) -> str:
+        """Get the optimized system instruction"""
+        return """ServerGem: Deploy to Cloud Run.
+
+RULES:
+- NO user GCP auth needed
+- Provide .servergem.app URLs
+
+STATE:
+IF "Project Path:" exists → ONLY call deploy_to_cloudrun
+IF user says "deploy"/"yes"/"go" → IMMEDIATELY deploy
+ELSE → call clone_and_analyze_repo
+
+Env vars auto-parsed from .env. Never clone twice.
+        """.strip()
 
     async def process_message(
         self, 
