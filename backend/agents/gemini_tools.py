@@ -1,6 +1,7 @@
 """
-Gemini API Function Declarations
+Gemini 3 API Function Declarations
 Compatible format for google-generativeai library
+✅ Updated for Gemini 3 Hackathon (gemini-2.5-flash)
 """
 
 def get_gemini_api_tools():
