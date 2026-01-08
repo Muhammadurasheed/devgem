@@ -1,11 +1,19 @@
+/**
+ * GitHub Context - OAuth Integration
+ * Handles GitHub OAuth flow with backend endpoints
+ */
+
 import { createContext, useContext, useEffect, useState, useCallback, ReactNode } from 'react';
 import { toast } from 'sonner';
+
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 interface GitHubUser {
     login: string;
     name: string;
     avatar_url: string;
     email?: string;
+    id?: number;
 }
 
 interface GitHubRepo {
@@ -32,12 +40,15 @@ interface GitHubContextType {
     fetchRepositories: () => Promise<void>;
     validateToken: (token: string) => Promise<boolean>;
     getToken: () => string | null;
+    // New OAuth methods
+    initiateOAuth: () => Promise<void>;
+    handleOAuthCallback: (code: string) => Promise<boolean>;
 }
 
 const GitHubContext = createContext<GitHubContextType | null>(null);
 
-export const GITHUB_TOKEN_KEY = 'servergem_github_token';
-export const GITHUB_USER_KEY = 'servergem_github_user';
+export const GITHUB_TOKEN_KEY = 'devgem_github_token';
+export const GITHUB_USER_KEY = 'devgem_github_user';
 
 export function GitHubProvider({ children }: { children: ReactNode }) {
     const [token, setToken] = useState<string | null>(null);
@@ -82,7 +93,8 @@ export function GitHubProvider({ children }: { children: ReactNode }) {
                     login: userData.login,
                     name: userData.name || userData.login,
                     avatar_url: userData.avatar_url,
-                    email: userData.email
+                    email: userData.email,
+                    id: userData.id
                 };
 
                 setUser(githubUser);
@@ -98,7 +110,7 @@ export function GitHubProvider({ children }: { children: ReactNode }) {
         }
     }, []);
 
-    // Connect with GitHub token
+    // Connect with GitHub token (direct token - for backward compatibility)
     const connect = useCallback(async (githubToken: string) => {
         setIsLoading(true);
         try {
@@ -108,10 +120,10 @@ export function GitHubProvider({ children }: { children: ReactNode }) {
                 setToken(githubToken);
                 setIsConnected(true);
                 localStorage.setItem(GITHUB_TOKEN_KEY, githubToken);
-                toast.success('Successfully connected to GitHub!');
+                toast.success('Connected to GitHub!');
                 return true;
             } else {
-                toast.error('Invalid GitHub token. Please check and try again.');
+                toast.error('Invalid GitHub token');
                 return false;
             }
         } catch (error) {
@@ -122,6 +134,72 @@ export function GitHubProvider({ children }: { children: ReactNode }) {
             setIsLoading(false);
         }
     }, [validateToken]);
+
+    // Initiate OAuth flow - redirects to GitHub
+    const initiateOAuth = useCallback(async () => {
+        setIsLoading(true);
+        try {
+            const response = await fetch(`${API_BASE_URL}/auth/github/login`);
+            if (!response.ok) {
+                throw new Error('Failed to initiate OAuth');
+            }
+            const data = await response.json();
+            
+            // Redirect to GitHub authorization page
+            window.location.href = data.url;
+        } catch (error) {
+            console.error('OAuth initiation failed:', error);
+            toast.error('Failed to connect to GitHub. Please try again.');
+            setIsLoading(false);
+        }
+    }, []);
+
+    // Handle OAuth callback - exchange code for token
+    const handleOAuthCallback = useCallback(async (code: string): Promise<boolean> => {
+        setIsLoading(true);
+        try {
+            const response = await fetch(`${API_BASE_URL}/auth/github/callback`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ code }),
+            });
+
+            if (!response.ok) {
+                const error = await response.json();
+                throw new Error(error.detail || 'OAuth callback failed');
+            }
+
+            const data = await response.json();
+            
+            // Store token and user info
+            const accessToken = data.token;
+            const userInfo: GitHubUser = {
+                login: data.user.login,
+                name: data.user.name || data.user.login,
+                avatar_url: data.user.avatar_url,
+                email: data.user.email,
+                id: data.user.id
+            };
+
+            setToken(accessToken);
+            setUser(userInfo);
+            setIsConnected(true);
+            
+            localStorage.setItem(GITHUB_TOKEN_KEY, accessToken);
+            localStorage.setItem(GITHUB_USER_KEY, JSON.stringify(userInfo));
+            
+            toast.success(`Welcome, ${userInfo.name}!`);
+            return true;
+        } catch (error) {
+            console.error('OAuth callback error:', error);
+            toast.error('GitHub authentication failed. Please try again.');
+            return false;
+        } finally {
+            setIsLoading(false);
+        }
+    }, []);
 
     // Disconnect from GitHub
     const disconnect = useCallback(() => {
@@ -137,9 +215,6 @@ export function GitHubProvider({ children }: { children: ReactNode }) {
     // Fetch user repositories
     const fetchRepositories = useCallback(async () => {
         if (!token) {
-            // Don't show toast on auto-fetch attempts if silent, usage depends on call site
-            // But for explicit calls (RepoSelector), we want feedback.
-            // We'll keep it simple for now.
             return;
         }
 
@@ -175,14 +250,12 @@ export function GitHubProvider({ children }: { children: ReactNode }) {
             }
 
             setRepositories(allRepos);
-            // toast.success(`Loaded ${allRepos.length} repositories`); // Optional: avoid spam
         } catch (error) {
             console.error('Error fetching repositories:', error);
 
-            // Handle 401 Unauthorized (Expired Token)
             if (error instanceof Error && error.message.includes('401')) {
                 toast.error('GitHub session expired. Please reconnect.');
-                disconnect(); // This will now update GLOBAL state!
+                disconnect();
             } else {
                 toast.error('Failed to load repositories');
             }
@@ -204,7 +277,9 @@ export function GitHubProvider({ children }: { children: ReactNode }) {
             disconnect,
             fetchRepositories,
             validateToken,
-            getToken
+            getToken,
+            initiateOAuth,
+            handleOAuthCallback
         }}>
             {children}
         </GitHubContext.Provider>
