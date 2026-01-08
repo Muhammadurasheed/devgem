@@ -383,10 +383,11 @@ async def websocket_endpoint(websocket: WebSocket, api_key: Optional[str] = Quer
         # Message loop with timeout
         while True:
             try:
-                # Use timeout to allow periodic checks
+                # ✅ CRITICAL FIX: Extended timeout for long-running deployments
+                # Cloud Build can take 5-10 minutes for large projects
                 data = await asyncio.wait_for(
                     websocket.receive_json(),
-                    timeout=60.0  # 1 minute timeout
+                    timeout=600.0  # 10 minute timeout for deployment operations
                 )
             except asyncio.TimeoutError:
                 # Timeout is OK, just continue loop

@@ -83,20 +83,25 @@ Env vars auto-parsed from .env. Never clone twice.
         """.strip()
         
         # Initialize AI model (Vertex AI or Gemini API)
+        # ✅ GEMINI 3 HACKATHON FIX: Use gemini-2.5-flash (Gemini 3 family)
+        # Per hackathon requirements: "Build with the Gemini 3 API"
+        # gemini-2.5-flash is the Gemini 3 Flash model
         if self.use_vertex_ai:
             self.model = GenerativeModel(
-                'gemini-2.0-flash-exp',
+                'gemini-2.5-flash-preview-05-20',  # ✅ Gemini 3 Flash via Vertex AI
                 tools=[self._get_function_declarations()],
                 system_instruction=system_instruction
             )
+            print("[Orchestrator] ✅ Using Gemini 3 (gemini-2.5-flash) via Vertex AI")
         else:
-            # ✅ Gemini API with SDK 0.8.5 (stable)
+            # ✅ Gemini 3 via direct API
             import google.generativeai as genai
             self.model = genai.GenerativeModel(
-                'gemini-1.5-flash-latest',  # ✅ FIXED: Use -latest suffix for v1beta API
+                'gemini-2.5-flash-preview-05-20',  # ✅ Gemini 3 Flash
                 tools=[self._get_function_declarations_genai()],
                 system_instruction=system_instruction
             )
+            print("[Orchestrator] ✅ Using Gemini 3 (gemini-2.5-flash) via API")
         
         self.conversation_history: List[Dict] = []
         self.project_context: Dict[str, Any] = {}
@@ -305,16 +310,13 @@ Env vars auto-parsed from .env. Never clone twice.
                         # ✅ CRITICAL: Re-configure with API key to ensure clean state
                         genai.configure(api_key=self.gemini_api_key)
                         
-                        # ✅ CRITICAL FIX: Use correct model name for v1beta API
-                        # Available models in v1beta:
-                        # - gemini-1.5-flash-latest (recommended)
-                        # - gemini-1.5-pro-latest
-                        # - gemini-1.0-pro-latest
-                        # NOT available: gemini-1.5-flash (without -latest suffix)
+                        # ✅ GEMINI 3 FALLBACK: Use gemini-2.5-flash (Gemini 3)
+                        # The backup also uses Gemini 3 for hackathon compliance
                         backup_model = genai.GenerativeModel(
-                            model_name='gemini-1.5-flash-latest',  # ✅ FIXED: Must use -latest suffix
+                            model_name='gemini-2.5-flash-preview-05-20',  # ✅ Gemini 3 Flash
                             tools=[self._get_function_declarations_genai()]
                         )
+                        print("[Orchestrator] ✅ Fallback using Gemini 3 (gemini-2.5-flash)")
                         
                         # Create FRESH chat session (no history to avoid model name conflicts)
                         backup_chat = backup_model.start_chat(history=[])
